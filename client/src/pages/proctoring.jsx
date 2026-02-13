@@ -4,103 +4,45 @@ import { io } from "socket.io-client";
 
 const streamStore = {};
 
-export default function ProctorUI() {
+function ProctorUI() {
   const [roomId, setRoomId] = useState("");
   const [joined, setJoined] = useState(false);
   const [studentIds, setStudentIds] = useState([]);
-  const [tick, setTick] = useState(0);
-  const [audioOn, setAudioOn] = useState(false);
+  const [renderTick, setRenderTick] = useState(0);
+  const [roomStats, setRoomStats] = useState(null);
+  const [logs, setLogs] = useState([]);
 
   const socketRef = useRef(null);
   const deviceRef = useRef(null);
-  const consumed = useRef(new Set());
-  const started = useRef(false);
+  const recvTransportRef = useRef(null);
+  const consumedSet = useRef(new Set());
+  const initDone = useRef(false);
 
-  // KEY: one recv transport per worker
-  const workerTransports = useRef(new Map()); // workerIndex -> transport
-  const transportPromises = useRef(new Map()); // workerIndex -> Promise
-
-  function refresh() {
-    setTick((t) => t + 1);
+  function log(msg) {
+    const entry = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    console.log(entry);
+    setLogs((prev) => [...prev.slice(-30), entry]);
   }
 
-  // get or create recv transport for a specific worker
-  // uses promise cache so we don't create duplicates
-  function getRecvTransport(workerIndex) {
-    // already have it
-    if (workerTransports.current.has(workerIndex)) {
-      return Promise.resolve(workerTransports.current.get(workerIndex));
-    }
-
-    // already creating it
-    if (transportPromises.current.has(workerIndex)) {
-      return transportPromises.current.get(workerIndex);
-    }
-
-    // create new
-    const promise = new Promise((resolve) => {
-      const socket = socketRef.current;
-      const device = deviceRef.current;
-      if (!socket || !device) return resolve(null);
-
-      console.log(`Creating recv transport for worker ${workerIndex}...`);
-
-      socket.emit(
-        "createTransport",
-        { type: "recv", workerIndex },
-        (data) => {
-          if (!data || data.error) {
-            console.error(`Transport error worker ${workerIndex}:`, data?.error);
-            transportPromises.current.delete(workerIndex);
-            return resolve(null);
-          }
-
-          const transport = device.createRecvTransport({
-            id: data.id,
-            iceParameters: data.iceParameters,
-            iceCandidates: data.iceCandidates,
-            dtlsParameters: data.dtlsParameters,
-          });
-
-          transport.on("connect", ({ dtlsParameters }, cb, eb) => {
-            socket.emit(
-              "connectTransport",
-              { transportId: transport.id, dtlsParameters },
-              (r) => (r?.connected ? cb() : eb(new Error(r?.error)))
-            );
-          });
-
-          workerTransports.current.set(workerIndex, transport);
-          transportPromises.current.delete(workerIndex);
-          console.log(`✅ Recv transport on worker ${workerIndex} ready`);
-          resolve(transport);
-        }
-      );
-    });
-
-    transportPromises.current.set(workerIndex, promise);
-    return promise;
+  function forceUpdate() {
+    setRenderTick((t) => t + 1);
   }
 
-  // consume one producer
   const consumeProducer = useCallback(
-    async ({ producerId, socketId, kind, type, workerIndex }) => {
-      if (consumed.current.has(producerId)) return;
-      consumed.current.add(producerId);
+    ({ producerId, socketId, kind, type }) => {
+      if (consumedSet.current.has(producerId)) return;
+      consumedSet.current.add(producerId);
 
       const socket = socketRef.current;
       const device = deviceRef.current;
-      if (!socket || !device) {
-        consumed.current.delete(producerId);
+      const transport = recvTransportRef.current;
+
+      if (!socket || !device || !transport) {
+        consumedSet.current.delete(producerId);
         return;
       }
 
-      // get transport for the worker this producer is on
-      const transport = await getRecvTransport(workerIndex);
-      if (!transport) {
-        consumed.current.delete(producerId);
-        return;
-      }
+      log(`Consuming ${kind} from ${socketId.slice(0, 8)} (PROCTOR PRIORITY)`);
 
       socket.emit(
         "consume",
@@ -111,8 +53,8 @@ export default function ProctorUI() {
         },
         async (res) => {
           if (!res || res.error) {
-            console.error("Consume error:", res?.error);
-            consumed.current.delete(producerId);
+            log(`Consume error: ${res?.error}`);
+            consumedSet.current.delete(producerId);
             return;
           }
 
@@ -125,49 +67,34 @@ export default function ProctorUI() {
             });
 
             const track = consumer.track;
-            const sType = type || "camera";
+            const streamType = type || "camera";
+
+            track.onended = () => log(`Track ended: ${socketId.slice(0, 8)} ${kind}`);
+            track.onmute = () => log(`Track muted: ${socketId.slice(0, 8)} ${kind}`);
+            track.onunmute = () => log(`Track unmuted: ${socketId.slice(0, 8)} ${kind}`);
 
             if (!streamStore[socketId]) streamStore[socketId] = {};
-
-            if (sType === "camera") {
-              if (!streamStore[socketId].camera)
-                streamStore[socketId].camera = new MediaStream();
-              if (!streamStore[socketId].audio)
-                streamStore[socketId].audio = new MediaStream();
-
-              if (track.kind === "audio") {
-                streamStore[socketId].camera
-                  .getAudioTracks()
-                  .forEach((t) => streamStore[socketId].camera.removeTrack(t));
-                streamStore[socketId].audio
-                  .getAudioTracks()
-                  .forEach((t) => streamStore[socketId].audio.removeTrack(t));
-                streamStore[socketId].camera.addTrack(track);
-                streamStore[socketId].audio.addTrack(track);
-              } else {
-                streamStore[socketId].camera
-                  .getVideoTracks()
-                  .forEach((t) => streamStore[socketId].camera.removeTrack(t));
-                streamStore[socketId].camera.addTrack(track);
-              }
+            if (!streamStore[socketId][streamType]) {
+              streamStore[socketId][streamType] = new MediaStream();
             }
 
-            if (sType === "screen") {
-              if (!streamStore[socketId].screen)
-                streamStore[socketId].screen = new MediaStream();
-              streamStore[socketId].screen
-                .getVideoTracks()
-                .forEach((t) => streamStore[socketId].screen.removeTrack(t));
-              streamStore[socketId].screen.addTrack(track);
-            }
+            streamStore[socketId][streamType]
+              .getTracks()
+              .filter((t) => t.kind === track.kind)
+              .forEach((t) => streamStore[socketId][streamType].removeTrack(t));
 
-            setStudentIds((prev) =>
-              prev.includes(socketId) ? prev : [...prev, socketId]
-            );
-            refresh();
+            streamStore[socketId][streamType].addTrack(track);
+
+            setStudentIds((prev) => {
+              if (!prev.includes(socketId)) return [...prev, socketId];
+              return prev;
+            });
+
+            forceUpdate();
+            log(`✅ ${kind} consuming from ${socketId.slice(0, 8)} (HIGH QUALITY)`);
           } catch (e) {
-            console.error("Consumer error:", e);
-            consumed.current.delete(producerId);
+            log(`Consumer error: ${e.message}`);
+            consumedSet.current.delete(producerId);
           }
         }
       );
@@ -176,162 +103,250 @@ export default function ProctorUI() {
   );
 
   function handleJoin() {
-    if (!roomId.trim() || started.current) return;
-    started.current = true;
+    if (!roomId.trim()) return;
+    if (initDone.current) return;
+    initDone.current = true;
 
+    log("Joining as PROCTOR...");
     const socket = io("http://localhost:3000");
     socketRef.current = socket;
 
     socket.on("connect", () => {
-      socket.emit("join", roomId);
+      log(`Connected: ${socket.id}`);
+      // JOIN AS PROCTOR
+      socket.emit("join", roomId, "proctor");
     });
+
+    socket.on("role", (r) => log(`Role: ${r}`));
 
     socket.on("rtp", async (rtp) => {
       if (deviceRef.current) return;
 
-      const device = new Device();
-      await device.load({ routerRtpCapabilities: rtp });
-      deviceRef.current = device;
-      console.log("Device loaded");
+      try {
+        const device = new Device();
+        await device.load({ routerRtpCapabilities: rtp });
+        deviceRef.current = device;
+        log("Device loaded");
 
-      // get existing producers
-      socket.emit("getProducers", (producers) => {
-        console.log(`${producers.length} existing producers`);
-        // consume in small batches to avoid CPU spike
-        let i = 0;
-        function consumeNext() {
-          if (i >= producers.length) return;
-          consumeProducer(producers[i]);
-          i++;
-          setTimeout(consumeNext, 100); // 100ms between each
-        }
-        consumeNext();
-      });
+        socket.emit("createTransport", { type: "recv" }, (data) => {
+          if (!data || data.error) {
+            log(`Transport error: ${data?.error}`);
+            return;
+          }
+
+          const transport = device.createRecvTransport({
+            id: data.id,
+            iceParameters: data.iceParameters,
+            iceCandidates: data.iceCandidates,
+            dtlsParameters: data.dtlsParameters,
+          });
+          recvTransportRef.current = transport;
+
+          transport.on("connect", ({ dtlsParameters }, cb, errback) => {
+            socket.emit(
+              "connectTransport",
+              { transportId: transport.id, dtlsParameters },
+              (res) => {
+                if (res?.connected) cb();
+                else errback(new Error(res?.error || "fail"));
+              }
+            );
+          });
+
+          transport.on("connectionstatechange", (state) => {
+            log(`ICE: ${state}`);
+            if (state === "failed") log("⚠️ Check announcedIp in config!");
+          });
+
+          log("Transport ready, getting producers...");
+          socket.emit("getProducers", (producers) => {
+            log(`Got ${producers?.length} existing producers`);
+            if (producers) producers.forEach(consumeProducer);
+          });
+        });
+      } catch (e) {
+        log(`Device error: ${e.message}`);
+      }
     });
 
     socket.on("newProducer", (info) => {
+      log(`New producer: ${info.kind} from ${info.socketId.slice(0, 8)}`);
       consumeProducer(info);
     });
 
-    socket.on("studentLeft", (sid) => {
-      delete streamStore[sid];
-      setStudentIds((prev) => prev.filter((id) => id !== sid));
-      refresh();
+    socket.on("studentLeft", (socketId) => {
+      log(`Student left: ${socketId.slice(0, 8)}`);
+      delete streamStore[socketId];
+      setStudentIds((prev) => prev.filter((id) => id !== socketId));
+      forceUpdate();
     });
 
     socket.on("consumerClosed", ({ producerId }) => {
-      consumed.current.delete(producerId);
+      consumedSet.current.delete(producerId);
     });
+
+    // Poll room stats every 5 seconds
+    const statsInterval = setInterval(() => {
+      socket.emit("getRoomStats", (stats) => {
+        if (stats && !stats.error) setRoomStats(stats);
+      });
+    }, 5000);
+
+    socket.on("disconnect", () => clearInterval(statsInterval));
 
     setJoined(true);
   }
 
   useEffect(() => {
     return () => {
-      socketRef.current?.disconnect();
+      if (socketRef.current) socketRef.current.disconnect();
       Object.keys(streamStore).forEach((k) => delete streamStore[k]);
     };
   }, []);
 
-  if (!joined) {
-    return (
-      <div style={{ padding: 40, textAlign: "center" }}>
-        <h2>Proctor Dashboard</h2>
-        <input
-          value={roomId}
-          onChange={(e) => setRoomId(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleJoin()}
-          placeholder="Room ID"
-          style={{ padding: 10, fontSize: 16, marginRight: 10 }}
-        />
-        <button onClick={handleJoin} style={{ padding: 10, fontSize: 16 }}>
-          Join
-        </button>
-      </div>
-    );
-  }
-
   return (
     <div style={{ padding: 10 }}>
-      <div style={{ marginBottom: 10, display: "flex", justifyContent: "space-between" }}>
-        <h3 style={{ margin: 0 }}>
-          Room: {roomId} | Students: {studentIds.length} |
-          Workers: {workerTransports.current.size}
-        </h3>
-        <button onClick={() => setAudioOn((a) => !a)} style={{ padding: "5px 15px" }}>
-          {audioOn ? "🔊 Audio ON" : "🔇 Audio OFF"}
-        </button>
-      </div>
+      {!joined ? (
+        <div>
+          <h3>OmniView Proctor</h3>
+          <input
+            type="text"
+            value={roomId}
+            onChange={(e) => setRoomId(e.target.value)}
+            placeholder="Room ID"
+          />
+          <button onClick={handleJoin}>Join as Proctor</button>
+        </div>
+      ) : (
+        <div>
+          <h3>
+            Room: {roomId} | Students: {studentIds.length}
+            {roomStats && (
+              <span style={{ fontSize: 12, marginLeft: 10, color: "#666" }}>
+                | Producers: {roomStats.producers} | Consumers: {roomStats.consumers}
+              </span>
+            )}
+          </h3>
 
-      {studentIds.length === 0 && <p>Waiting for students...</p>}
+          {/* Network stats bar */}
+          {roomStats?.networkStats && Object.keys(roomStats.networkStats).length > 0 && (
+            <div
+              style={{
+                padding: 5,
+                backgroundColor: "#e8f5e9",
+                marginBottom: 10,
+                fontSize: 12,
+                fontFamily: "monospace",
+              }}
+            >
+              {Object.entries(roomStats.networkStats).map(([sid, ns]) => (
+                <span key={sid} style={{ marginRight: 15 }}>
+                  {sid}: RTT={ns.rtt}ms Loss={ns.packetLoss}
+                </span>
+              ))}
+            </div>
+          )}
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-        {studentIds.map((sid) => (
-          <StudentCard key={sid} socketId={sid} tick={tick} audioOn={audioOn} />
-        ))}
-      </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+            {studentIds.map((sid) => (
+              <StudentCard key={sid} socketId={sid} tick={renderTick} log={log} />
+            ))}
+          </div>
+
+          {/* Logs */}
+          <div
+            style={{
+              marginTop: 20,
+              padding: 10,
+              backgroundColor: "#111",
+              color: "#0f0",
+              fontFamily: "monospace",
+              fontSize: 11,
+              maxHeight: 200,
+              overflow: "auto",
+            }}
+          >
+            {logs.map((l, i) => (
+              <div key={i}>{l}</div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function StudentCard({ socketId, tick, audioOn }) {
-  const [main, setMain] = useState("camera");
-  const mainRef = useRef(null);
-  const pipRef = useRef(null);
-  const audioRef = useRef(null);
-
+function StudentCard({ socketId, tick, log }) {
+  const cameraRef = useRef(null);
+  const screenRef = useRef(null);
+  const playingRef = useRef(false);
   const streams = streamStore[socketId] || {};
-  const hasCam = !!streams.camera;
-  const hasScr = !!streams.screen;
-  const pip = main === "camera" ? "screen" : "camera";
 
   useEffect(() => {
-    if (mainRef.current && streams[main]) {
-      if (mainRef.current.srcObject !== streams[main])
-        mainRef.current.srcObject = streams[main];
-      mainRef.current.play().catch(() => {});
+    const el = cameraRef.current;
+    const stream = streams.camera;
+    if (!el || !stream) return;
+
+    if (el.srcObject !== stream) {
+      el.srcObject = stream;
+      playingRef.current = false;
     }
-  }, [tick, main, streams]);
+
+    if (!playingRef.current) {
+      const timer = setTimeout(() => {
+        el.play()
+          .then(() => {
+            playingRef.current = true;
+            log(`▶️ Playing ${socketId.slice(0, 8)} (${el.videoWidth}x${el.videoHeight})`);
+          })
+          .catch((e) => log(`Play error: ${e.message}`));
+      }, 150);
+      return () => clearTimeout(timer);
+    }
+  }, [tick, socketId]);
 
   useEffect(() => {
-    if (pipRef.current && streams[pip]) {
-      if (pipRef.current.srcObject !== streams[pip])
-        pipRef.current.srcObject = streams[pip];
-      pipRef.current.play().catch(() => {});
-    }
-  }, [tick, pip, streams]);
-
-  useEffect(() => {
-    if (audioRef.current && streams.audio) {
-      if (audioRef.current.srcObject !== streams.audio)
-        audioRef.current.srcObject = streams.audio;
-      audioRef.current.muted = !audioOn;
-      audioRef.current.volume = 0.6;
-      if (audioOn) audioRef.current.play().catch(() => {});
-    }
-  }, [tick, audioOn, streams]);
+    const el = screenRef.current;
+    const stream = streams.screen;
+    if (!el || !stream) return;
+    if (el.srcObject !== stream) el.srcObject = stream;
+    setTimeout(() => el.play().catch(() => { }), 150);
+  }, [tick, socketId]);
 
   return (
-    <div style={{ border: "1px solid #ccc", width: 340, background: "#111", borderRadius: 8, overflow: "hidden" }}>
-      <audio ref={audioRef} autoPlay playsInline />
-      <div style={{ padding: "6px 10px", background: "#222", color: "#fff", fontSize: 12, display: "flex", justifyContent: "space-between" }}>
-        <span>🟢 {socketId.slice(0, 8)}...</span>
-        <span>{hasCam && "📷"} {hasScr && "🖥️"}</span>
+    <div
+      style={{
+        border: "2px solid #666",
+        padding: 8,
+        width: 320,
+        backgroundColor: "#f0f0f0",
+      }}
+    >
+      <div style={{ fontWeight: "bold", marginBottom: 5 }}>
+        {socketId.slice(0, 12)}
+        {streams.camera && ` (${streams.camera.getTracks().length} tracks)`}
       </div>
-      <div style={{ position: "relative", width: "100%", height: 200 }}>
-        <video ref={mainRef} autoPlay playsInline muted style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }} />
-        <span style={{ position: "absolute", top: 4, left: 4, background: "rgba(0,0,0,0.6)", color: "#fff", fontSize: 10, padding: "2px 6px", borderRadius: 3 }}>
-          {main === "camera" ? "📷 Camera" : "🖥️ Screen"}
-        </span>
-        {hasCam && hasScr && (
-          <div onClick={() => setMain((m) => (m === "camera" ? "screen" : "camera"))} style={{ position: "absolute", bottom: 6, right: 6, width: 110, height: 70, border: "2px solid rgba(255,255,255,0.4)", borderRadius: 6, overflow: "hidden", cursor: "pointer", background: "#000" }}>
-            <video ref={pipRef} autoPlay playsInline muted style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-            <span style={{ position: "absolute", top: 2, left: 2, fontSize: 9, background: "rgba(0,0,0,0.6)", color: "#fff", padding: "1px 4px", borderRadius: 2 }}>
-              {pip === "camera" ? "📷" : "🖥️"} 🔄
-            </span>
-          </div>
-        )}
+      <div>
+        <video
+          ref={cameraRef}
+          autoPlay
+          playsInline
+          muted
+          style={{ width: "100%", height: 200, backgroundColor: "#000" }}
+        />
       </div>
+      {streams.screen && (
+        <div>
+          <video
+            ref={screenRef}
+            autoPlay
+            playsInline
+            style={{ width: "100%", height: 200, backgroundColor: "#000" }}
+          />
+        </div>
+      )}
     </div>
   );
 }
+
+export default ProctorUI;

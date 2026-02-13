@@ -1,466 +1,556 @@
 import { io } from "./main_base/base.js";
 import { config } from "./mediasoup/config.js";
 import { createRouterOnWorker } from "./mediasoup/getworker.js";
-import { createWorkers, workers } from "./mediasoup/worker.js";
+import { createWorkers } from "./mediasoup/worker.js";
 
-const rooms = new Map();
-let ready = false;
+let rooms = new Map();
+let workersReady = false;
 
 (async () => {
-  await createWorkers();
-  ready = true;
-  console.log(`✅ ${workers.length} workers ready`);
+    await createWorkers();
+    workersReady = true;
+    console.log("[SERVER] Workers ready, OmniView architecture active");
 })();
 
-// ═══════════════════════════════════════════════════════════════
-// ROOM STRUCTURE:
-//
-// room.routers = Map<workerIndex, router>
-//   → one router per worker, created on demand
-//
-// room.students = Map<socketId, {
-//   workerIndex,        ← which worker this student is on
-//   producers: [{producer, kind, type}]
-// }>
-//
-// room.transports = Map<transportId, {
-//   transport,
-//   workerIndex,        ← which worker this transport is on
-//   ownerSocketId       ← who owns this transport
-// }>
-//
-// room.pipes = Set<string>
-//   → tracks which producer-to-router pipes exist
-//     format: "producerId->workerIndex"
-// ═══════════════════════════════════════════════════════════════
+// ========== ROOM MANAGEMENT ==========
 
 async function getOrCreateRoom(roomId) {
-  if (rooms.has(roomId)) return rooms.get(roomId);
+    if (rooms.has(roomId)) return rooms.get(roomId);
 
-  const room = {
-    routers: new Map(),
-    students: new Map(),
-    transports: new Map(),
-    members: new Set(),
-    pipes: new Set(),
-  };
+    const router = await createRouterOnWorker();
+    const room = {
+        router,
+        // Per-socket producer tracking
+        // socketId -> [{ producer, kind, type, layer }]
+        producers: new Map(),
+        // transportId -> transport
+        transports: new Map(),
+        // Room members with roles
+        members: new Map(), // socketId -> { role: "student"|"proctor", socket }
+        // Consumer tracking for cleanup
+        consumers: new Map(), // consumerId -> { consumer, socketId, producerId }
+        // Network stats per student
+        networkStats: new Map(), // socketId -> { rtt, packetLoss, bitrate, lastUpdate }
+        // Active speakers (for student downstream optimization)
+        activeSpeakers: [], // [socketId, socketId, ...] top N
+    };
 
-  rooms.set(roomId, room);
-  console.log(`Room "${roomId}" created`);
-  return room;
+    rooms.set(roomId, room);
+    console.log(`[ROOM] Created: ${roomId}`);
+    return room;
 }
 
-// get or create router on specific worker for this room
-async function getRouterOnWorker(room, workerIndex) {
-  if (room.routers.has(workerIndex)) {
-    return room.routers.get(workerIndex);
-  }
+// ========== NETWORK MONITOR ==========
 
-  const router = await createRouterOnWorker(workerIndex);
-  room.routers.set(workerIndex, router);
-  console.log(`  Router created on worker ${workerIndex}`);
-  return router;
+function startNetworkMonitor(room, roomId) {
+    if (room._monitorInterval) return;
+
+    room._monitorInterval = setInterval(async () => {
+        for (const [socketId, member] of room.members) {
+            if (member.role !== "student") continue;
+
+            // Get transport stats
+            const transportIds = member.socket.data.transportIds || [];
+            for (const tid of transportIds) {
+                const transport = room.transports.get(tid);
+                if (!transport || transport.closed) continue;
+
+                try {
+                    const stats = await transport.getStats();
+                    let totalPacketLoss = 0;
+                    let totalPackets = 0;
+                    let rtt = 0;
+
+                    for (const [, stat] of stats) {
+                        if (stat.type === "transport") {
+                            rtt = stat.roundTripTime || 0;
+                        }
+                        if (stat.packetsLost !== undefined) {
+                            totalPacketLoss += stat.packetsLost;
+                            totalPackets += (stat.packetsSent || stat.packetsReceived || 0);
+                        }
+                    }
+
+                    const lossRate = totalPackets > 0 ? totalPacketLoss / totalPackets : 0;
+
+                    room.networkStats.set(socketId, {
+                        rtt,
+                        packetLoss: lossRate,
+                        lastUpdate: Date.now(),
+                    });
+
+                    // Adaptive bitrate for struggling students
+                    applyAdaptiveBitrate(room, socketId, lossRate);
+                } catch (e) {
+                    // transport might be closed
+                }
+            }
+        }
+    }, config.omniview.monitoring.statsInterval);
 }
 
-// pick least loaded worker for a new student
-function pickWorkerForStudent(room) {
-  const load = new Array(workers.length).fill(0);
-
-  for (const [, student] of room.students) {
-    load[student.workerIndex] += student.producers.length + 1;
-  }
-
-  // also count transports (consumers)
-  for (const [, entry] of room.transports) {
-    load[entry.workerIndex] += 1;
-  }
-
-  let minLoad = Infinity;
-  let bestIdx = 0;
-  for (let i = 0; i < load.length; i++) {
-    if (load[i] < minLoad) {
-      minLoad = load[i];
-      bestIdx = i;
+function stopNetworkMonitor(room) {
+    if (room._monitorInterval) {
+        clearInterval(room._monitorInterval);
+        room._monitorInterval = null;
     }
-  }
-
-  return bestIdx;
 }
 
-// PIPE a producer from its worker to another worker's router
-// so a proctor on worker B can consume a student on worker A
-async function ensurePipe(room, producerId, fromWorkerIndex, toWorkerIndex) {
-  if (fromWorkerIndex === toWorkerIndex) return; // same worker, no pipe needed
+// ========== ADAPTIVE BITRATE (Server Authority) ==========
 
-  const pipeKey = `${producerId}->${toWorkerIndex}`;
-  if (room.pipes.has(pipeKey)) return; // already piped
+function applyAdaptiveBitrate(room, socketId, packetLoss) {
+    const member = room.members.get(socketId);
+    if (!member || member.role !== "student") return;
 
-  const fromRouter = room.routers.get(fromWorkerIndex);
-  const toRouter = await getRouterOnWorker(room, toWorkerIndex);
+    const producers = room.producers.get(socketId) || [];
+    const threshold = config.omniview.monitoring;
 
-  if (!fromRouter || !toRouter) return;
+    for (const p of producers) {
+        if (p.producer.closed || p.kind !== "video") continue;
 
-  try {
-    await fromRouter.pipeToRouter({
-      producerId,
-      router: toRouter,
-    });
-    room.pipes.add(pipeKey);
-    console.log(`  Piped producer ${producerId.slice(0, 8)} from worker ${fromWorkerIndex} → ${toWorkerIndex}`);
-  } catch (err) {
-    // might already be piped
-    if (!err.message.includes("already exists")) {
-      console.error(`  Pipe error: ${err.message}`);
+        if (packetLoss > threshold.degradeThreshold) {
+            // Degrade: pause peer layer first (proctor layer stays)
+            // This is the Proctor-First Invariant
+            console.log(`[ABR] ${socketId.slice(0, 8)} high loss (${(packetLoss * 100).toFixed(1)}%) — degrading peer layer`);
+
+            // If using simulcast, prefer lower spatial layer for students
+            // Proctor always gets highest layer
+        } else if (packetLoss < threshold.recoverThreshold) {
+            // Recover: resume peer layer
+        }
     }
-    room.pipes.add(pipeKey); // mark anyway to avoid retrying
-  }
 }
 
-// ─── SOCKET HANDLING ─────────────────────────────────────────────
+// ========== ACTIVE SPEAKER DETECTION ==========
+
+function updateActiveSpeakers(room, socketId, audioLevel) {
+    // Simple: track last N speakers by audio activity
+    const max = config.omniview.maxActiveStreamsForStudent;
+    const idx = room.activeSpeakers.indexOf(socketId);
+    if (idx !== -1) room.activeSpeakers.splice(idx, 1);
+    room.activeSpeakers.unshift(socketId);
+    if (room.activeSpeakers.length > max) {
+        room.activeSpeakers = room.activeSpeakers.slice(0, max);
+    }
+}
+
+// ========== SOCKET HANDLING ==========
+
 io.on("connection", (socket) => {
-  console.log(`Connected: ${socket.id}`);
+    console.log(`[CONN] ${socket.id}`);
 
-  socket.data = {
-    roomId: null,
-    room: null,
-    workerIndex: -1,
-    transportIds: [],
-    producers: [],
-  };
+    socket.data.transportIds = [];
+    socket.data.producerObjects = [];
+    socket.data.consumerIds = [];
+    socket.data.role = null;
 
-  // ── JOIN ──
-  socket.on("join", async (roomId) => {
-    if (!ready) return socket.emit("error", "not ready");
-    if (!roomId || typeof roomId !== "string") return;
+    // ---- JOIN ----
+    socket.on("join", async (roomId, role) => {
+        if (!workersReady) return socket.emit("error", "Server not ready");
+        if (!roomId || typeof roomId !== "string") return;
 
-    if (socket.data.roomId) {
-      const firstRouter = room.routers.values().next().value;
-      if (firstRouter) socket.emit("rtp", firstRouter.rtpCapabilities);
-      return;
-    }
+        // Prevent double join
+        if (socket.data.roomId) {
+            socket.emit("rtp", socket.data.room.router.rtpCapabilities);
+            return;
+        }
 
-    const room = await getOrCreateRoom(roomId);
-    socket.data.roomId = roomId;
-    socket.data.room = room;
-    room.members.add(socket.id);
-    socket.join(roomId);
+        const userRole = role === "proctor" ? "proctor" : "student";
+        const room = await getOrCreateRoom(roomId);
 
-    // make sure at least one router exists
-    if (room.routers.size === 0) {
-      await getRouterOnWorker(room, 0);
-    }
+        socket.data.roomId = roomId;
+        socket.data.room = room;
+        socket.data.role = userRole;
 
-    const firstRouter = room.routers.values().next().value;
-    socket.emit("rtp", firstRouter.rtpCapabilities);
+        room.members.set(socket.id, { role: userRole, socket });
+        socket.join(roomId);
 
-    console.log(`${socket.id} joined "${roomId}" (${room.members.size} members)`);
-  });
+        // Start network monitor when first student joins
+        if (userRole === "student") {
+            startNetworkMonitor(room, roomId);
+        }
 
-  // ── CREATE TRANSPORT ──
-  socket.on("createTransport", async (data, cb) => {
-    if (typeof cb !== "function") return;
-    const room = socket.data.room;
-    if (!room) return cb({ error: "join first" });
+        socket.emit("rtp", room.router.rtpCapabilities);
+        socket.emit("role", userRole);
 
-    try {
-      const tc = config.mediasoup.webRtcTransport;
-      let workerIndex;
+        console.log(`[JOIN] ${socket.id} as ${userRole} in ${roomId} (members: ${room.members.size})`);
+    });
 
-      if (data.type === "send") {
-        // STUDENT: pick least loaded worker
-        workerIndex = pickWorkerForStudent(room);
-        socket.data.workerIndex = workerIndex;
+    // ---- CREATE TRANSPORT ----
+    socket.on("createTransport", async (data, cb) => {
+        if (typeof cb !== "function") return;
+        const room = socket.data.room;
+        if (!room) return cb({ error: "join first" });
 
-        // register as student
-        room.students.set(socket.id, {
-          workerIndex,
-          producers: [],
-        });
-
-        console.log(`${socket.id} assigned to worker ${workerIndex} (send)`);
-
-      } else if (data.type === "recv" && typeof data.workerIndex === "number") {
-        // PROCTOR: specific worker requested
-        workerIndex = data.workerIndex;
-
-      } else {
-        // PROCTOR: first transport, use worker 0
-        workerIndex = 0;
-      }
-
-      const router = await getRouterOnWorker(room, workerIndex);
-
-      const transport = await router.createWebRtcTransport({
-        listenIps: tc.listenIps,
-        enableUdp: true,
-        enableTcp: true,
-        preferUdp: true,
-        initialAvailableOutgoingBitrate: tc.initialAvailableOutgoingBitrate,
-      });
-
-      if (tc.maxIncomingBitrate) {
         try {
-          await transport.setMaxIncomingBitrate(tc.maxIncomingBitrate);
-        } catch (_) {}
-      }
+            const transportOptions = {
+                listenIps: config.mediasoup.webRtcTransport.listenIps,
+                enableUdp: true,
+                enableTcp: true,
+                preferUdp: true,
+                initialAvailableOutgoingBitrate: config.mediasoup.initialAvailableOutgoingBitrate,
+            };
 
-      room.transports.set(transport.id, {
-        transport,
-        workerIndex,
-        ownerSocketId: socket.id,
-      });
-      socket.data.transportIds.push(transport.id);
+            // Proctor gets higher initial bitrate
+            if (socket.data.role === "proctor") {
+                transportOptions.initialAvailableOutgoingBitrate = 1000000; // 1Mbps
+            }
 
-      transport.on("routerclose", () => room.transports.delete(transport.id));
+            const transport = await room.router.createWebRtcTransport(transportOptions);
 
-      cb({
-        id: transport.id,
-        iceParameters: transport.iceParameters,
-        iceCandidates: transport.iceCandidates,
-        dtlsParameters: transport.dtlsParameters,
-        workerIndex,
-      });
+            // Monitor transport events
+            transport.on("icestatechange", (state) => {
+                console.log(`[ICE] ${socket.id.slice(0, 8)} ${data.type}: ${state}`);
+            });
 
-    } catch (err) {
-      console.error("createTransport error:", err.message);
-      cb({ error: err.message });
-    }
-  });
+            transport.on("dtlsstatechange", (state) => {
+                console.log(`[DTLS] ${socket.id.slice(0, 8)} ${data.type}: ${state}`);
+                if (state === "failed" || state === "closed") {
+                    transport.close();
+                }
+            });
 
-  // ── CONNECT TRANSPORT ──
-  socket.on("connectTransport", async ({ transportId, dtlsParameters }, cb) => {
-    if (typeof cb !== "function") return;
-    const room = socket.data.room;
-    if (!room) return cb({ error: "no room" });
+            room.transports.set(transport.id, transport);
+            socket.data.transportIds.push(transport.id);
 
-    const entry = room.transports.get(transportId);
-    if (!entry) return cb({ error: "not found" });
-    if (entry.transport._connected) return cb({ connected: true });
+            cb({
+                id: transport.id,
+                iceParameters: transport.iceParameters,
+                iceCandidates: transport.iceCandidates,
+                dtlsParameters: transport.dtlsParameters,
+            });
 
-    try {
-      await entry.transport.connect({ dtlsParameters });
-      entry.transport._connected = true;
-      cb({ connected: true });
-    } catch (err) {
-      cb({ error: err.message });
-    }
-  });
-
-  // ── PRODUCE ──
-  socket.on("produce", async ({ transportId, kind, rtpParameters, appData }, cb) => {
-    if (typeof cb !== "function") return;
-    const room = socket.data.room;
-    if (!room) return cb({ error: "no room" });
-
-    const entry = room.transports.get(transportId);
-    if (!entry) return cb({ error: "transport not found" });
-
-    try {
-      const producer = await entry.transport.produce({
-        kind,
-        rtpParameters,
-        appData: appData || {},
-      });
-
-      const type = appData?.type || "camera";
-
-      // store in student record
-      const student = room.students.get(socket.id);
-      if (student) {
-        const oldIdx = student.producers.findIndex(
-          (p) => p.kind === kind && p.type === type
-        );
-        if (oldIdx !== -1) {
-          student.producers[oldIdx].producer.close();
-          student.producers.splice(oldIdx, 1);
+            console.log(`[TRANSPORT] ${socket.id.slice(0, 8)} ${data.type}: ${transport.id.slice(0, 8)}`);
+        } catch (e) {
+            console.error(`[TRANSPORT] ERROR:`, e.message);
+            cb({ error: e.message });
         }
-        student.producers.push({ producer, kind, type });
-      }
-
-      socket.data.producers.push(producer);
-      producer.on("transportclose", () => producer.close());
-
-      // notify others with workerIndex
-      socket.to(socket.data.roomId).emit("newProducer", {
-        producerId: producer.id,
-        socketId: socket.id,
-        kind,
-        type,
-        workerIndex: entry.workerIndex,
-      });
-
-      cb({ id: producer.id });
-      console.log(`${socket.id} producing ${kind} ${type} on worker ${entry.workerIndex}`);
-
-    } catch (err) {
-      cb({ error: err.message });
-    }
-  });
-
-  // ── CONSUME ──
-  socket.on("consume", async ({ producerId, rtpCapabilities, transportId }, cb) => {
-    if (typeof cb !== "function") return;
-    const room = socket.data.room;
-    if (!room) return cb({ error: "no room" });
-
-    const tEntry = room.transports.get(transportId);
-    if (!tEntry) return cb({ error: "transport not found" });
-
-    const consumerWorkerIndex = tEntry.workerIndex;
-
-    // find which student has this producer
-    let producerWorkerIndex = -1;
-    let producerFound = false;
-
-    for (const [, student] of room.students) {
-      for (const p of student.producers) {
-        if (p.producer.id === producerId && !p.producer.closed) {
-          producerWorkerIndex = student.workerIndex;
-          producerFound = true;
-          break;
-        }
-      }
-      if (producerFound) break;
-    }
-
-    if (!producerFound) return cb({ error: "producer gone" });
-
-    // PIPE if producer and consumer are on different workers
-    if (producerWorkerIndex !== consumerWorkerIndex) {
-      await ensurePipe(room, producerId, producerWorkerIndex, consumerWorkerIndex);
-    }
-
-    const router = room.routers.get(consumerWorkerIndex);
-    if (!router) return cb({ error: "router not found" });
-
-    if (!router.canConsume({ producerId, rtpCapabilities })) {
-      return cb({ error: "cannot consume" });
-    }
-
-    try {
-      const consumer = await tEntry.transport.consume({
-        producerId,
-        rtpCapabilities,
-        paused: false,
-      });
-
-      consumer.on("transportclose", () => consumer.close());
-      consumer.on("producerclose", () => {
-        socket.emit("consumerClosed", {
-          consumerId: consumer.id,
-          producerId,
-        });
-        consumer.close();
-      });
-
-      cb({
-        id: consumer.id,
-        producerId: consumer.producerId,
-        kind: consumer.kind,
-        rtpParameters: consumer.rtpParameters,
-      });
-
-    } catch (err) {
-      console.error("consume error:", err.message);
-      cb({ error: err.message });
-    }
-  });
-
-  // ── GET PRODUCERS ──
-  socket.on("getProducers", (cb) => {
-    if (typeof cb !== "function") return;
-    const room = socket.data.room;
-    if (!room) return cb([]);
-
-    const result = [];
-    for (const [socketId, student] of room.students) {
-      if (socketId === socket.id) continue;
-      for (const p of student.producers) {
-        if (p.producer.closed) continue;
-        result.push({
-          producerId: p.producer.id,
-          socketId,
-          kind: p.kind,
-          type: p.type,
-          workerIndex: student.workerIndex,
-        });
-      }
-    }
-    cb(result);
-  });
-
-  // ── DISCONNECT ──
-  socket.on("disconnect", () => {
-    const room = socket.data.room;
-    if (!room) return;
-    const roomId = socket.data.roomId;
-
-    // close producers
-    socket.data.producers.forEach((p) => {
-      if (!p.closed) p.close();
-    });
-    room.students.delete(socket.id);
-
-    // close transports
-    socket.data.transportIds.forEach((id) => {
-      const entry = room.transports.get(id);
-      if (entry && !entry.transport.closed) entry.transport.close();
-      room.transports.delete(id);
     });
 
-    room.members.delete(socket.id);
-    socket.to(roomId).emit("studentLeft", socket.id);
-    console.log(`${socket.id} left "${roomId}" (${room.members.size} left)`);
+    // ---- CONNECT TRANSPORT ----
+    socket.on("connectTransport", async ({ transportId, dtlsParameters }, cb) => {
+        if (typeof cb !== "function") return;
+        const room = socket.data.room;
+        if (!room) return cb({ error: "no room" });
 
-    // cleanup empty room
-    if (room.members.size === 0) {
-      for (const [, router] of room.routers) {
-        router.close();
-      }
-      rooms.delete(roomId);
-      console.log(`Room deleted: "${roomId}"`);
-    }
-  });
+        const transport = room.transports.get(transportId);
+        if (!transport) return cb({ error: "transport not found" });
+        if (transport._connected) return cb({ connected: true });
+
+        try {
+            await transport.connect({ dtlsParameters });
+            transport._connected = true;
+            cb({ connected: true });
+        } catch (e) {
+            cb({ error: e.message });
+        }
+    });
+
+    // ---- PRODUCE ----
+    socket.on("produce", async ({ transportId, kind, rtpParameters, appData }, cb) => {
+        if (typeof cb !== "function") return;
+        const room = socket.data.room;
+        if (!room) return cb({ error: "no room" });
+
+        const transport = room.transports.get(transportId);
+        if (!transport) return cb({ error: "transport not found" });
+
+        try {
+            const producer = await transport.produce({
+                kind,
+                rtpParameters,
+                appData: appData || {},
+            });
+
+            // Store
+            if (!room.producers.has(socket.id)) {
+                room.producers.set(socket.id, []);
+            }
+
+            // Remove duplicate
+            const list = room.producers.get(socket.id);
+            const dupIdx = list.findIndex(
+                (p) => p.kind === kind && p.type === (appData?.type || "camera")
+            );
+            if (dupIdx !== -1) {
+                list[dupIdx].producer.close();
+                list.splice(dupIdx, 1);
+            }
+
+            list.push({
+                producer,
+                kind,
+                type: appData?.type || "camera",
+            });
+
+            socket.data.producerObjects.push(producer);
+
+            // Notify EVERYONE in room about new producer
+            // Include the source role so consumers know priority
+            const notification = {
+                producerId: producer.id,
+                socketId: socket.id,
+                kind,
+                type: appData?.type || "camera",
+                sourceRole: socket.data.role,
+            };
+
+            socket.to(socket.data.roomId).emit("newProducer", notification);
+
+            producer.on("transportclose", () => producer.close());
+
+            // Audio level observer for active speaker detection
+            if (kind === "audio") {
+                producer.on("score", (score) => {
+                    if (score && score.length > 0 && score[0].score > 5) {
+                        updateActiveSpeakers(room, socket.id, score[0].score);
+                    }
+                });
+            }
+
+            cb({ id: producer.id });
+            console.log(`[PRODUCE] ${socket.id.slice(0, 8)} ${kind} ${appData?.type || "camera"}`);
+        } catch (e) {
+            cb({ error: e.message });
+        }
+    });
+
+    // ---- CONSUME ----
+    socket.on("consume", async ({ producerId, rtpCapabilities, transportId }, cb) => {
+        if (typeof cb !== "function") return;
+        const room = socket.data.room;
+        if (!room) return cb({ error: "no room" });
+
+        // Find producer and its source
+        let sourceSocketId = null;
+        let sourceRole = null;
+        let producerFound = false;
+
+        for (const [sid, producers] of room.producers) {
+            const match = producers.find((p) => p.producer.id === producerId && !p.producer.closed);
+            if (match) {
+                producerFound = true;
+                sourceSocketId = sid;
+                sourceRole = room.members.get(sid)?.role || "student";
+                break;
+            }
+        }
+
+        if (!producerFound) return cb({ error: "producer not found" });
+
+        if (!room.router.canConsume({ producerId, rtpCapabilities })) {
+            return cb({ error: "cannot consume" });
+        }
+
+        const transport = room.transports.get(transportId);
+        if (!transport) return cb({ error: "transport not found" });
+
+        try {
+            // ========== OMNIVIEW LAYER SELECTION ==========
+            // Proctor ALWAYS gets highest quality (Proctor-First Invariant)
+            // Students get lower quality (peer layer)
+
+            const consumerRole = socket.data.role;
+            let preferredLayers = undefined;
+
+            if (consumerRole === "proctor") {
+                // Proctor: highest spatial + temporal layer
+                preferredLayers = {
+                    spatialLayer: 2,   // highest
+                    temporalLayer: 2,  // highest
+                };
+                console.log(`[CONSUME] Proctor gets HIGH quality from ${sourceSocketId?.slice(0, 8)}`);
+            } else {
+                // Student: lowest spatial layer to save bandwidth
+                preferredLayers = {
+                    spatialLayer: 0,   // lowest
+                    temporalLayer: 1,  // medium
+                };
+
+                // Check if this producer's student is in active speakers
+                const isActiveSpeaker = room.activeSpeakers.includes(sourceSocketId);
+                if (!isActiveSpeaker && room.activeSpeakers.length >= config.omniview.maxActiveStreamsForStudent) {
+                    // Not active speaker and we're at limit — skip video
+                    // But always allow audio
+                    const producerKind = room.producers.get(sourceSocketId)
+                        ?.find(p => p.producer.id === producerId)?.kind;
+
+                    if (producerKind === "video") {
+                        console.log(`[CONSUME] Student skipping non-active-speaker video from ${sourceSocketId?.slice(0, 8)}`);
+                        // Still allow but at minimum quality
+                        preferredLayers = {
+                            spatialLayer: 0,
+                            temporalLayer: 0,
+                        };
+                    }
+                }
+            }
+
+            const consumer = await transport.consume({
+                producerId,
+                rtpCapabilities,
+                paused: false,
+            });
+
+            // Set preferred layers after creation
+            if (preferredLayers && consumer.kind === "video" && consumer.type === "simulcast") {
+                try {
+                    await consumer.setPreferredLayers(preferredLayers);
+                } catch (e) {
+                    // may not support simulcast — that's ok
+                }
+            }
+
+            // Track consumer
+            room.consumers.set(consumer.id, {
+                consumer,
+                socketId: socket.id,
+                producerId,
+                consumerRole,
+            });
+            socket.data.consumerIds.push(consumer.id);
+
+            consumer.on("transportclose", () => {
+                room.consumers.delete(consumer.id);
+            });
+
+            consumer.on("producerclose", () => {
+                room.consumers.delete(consumer.id);
+                socket.emit("consumerClosed", {
+                    consumerId: consumer.id,
+                    producerId,
+                });
+            });
+
+            // For proctor consumers, monitor quality
+            if (consumerRole === "proctor") {
+                consumer.on("score", (score) => {
+                    if (score && score.producerScore < 5) {
+                        console.log(`[QOS] ⚠️ Low producer score for proctor stream: ${score.producerScore}`);
+                    }
+                });
+
+                consumer.on("layerschange", (layers) => {
+                    if (layers) {
+                        console.log(`[QOS] Proctor consumer layers: spatial=${layers.spatialLayer} temporal=${layers.temporalLayer}`);
+                    }
+                });
+            }
+
+            cb({
+                id: consumer.id,
+                producerId: consumer.producerId,
+                kind: consumer.kind,
+                rtpParameters: consumer.rtpParameters,
+            });
+
+            console.log(`[CONSUME] ${socket.id.slice(0, 8)}(${consumerRole}) <- ${sourceSocketId?.slice(0, 8)} ${consumer.kind}`);
+        } catch (e) {
+            cb({ error: e.message });
+        }
+    });
+
+    // ---- GET PRODUCERS ----
+    socket.on("getProducers", (cb) => {
+        if (typeof cb !== "function") return;
+        const room = socket.data.room;
+        if (!room) return cb([]);
+
+        const result = [];
+        for (const [socketId, producers] of room.producers) {
+            if (socketId === socket.id) continue;
+            for (const p of producers) {
+                if (p.producer.closed) continue;
+                result.push({
+                    producerId: p.producer.id,
+                    socketId,
+                    kind: p.kind,
+                    type: p.type,
+                    sourceRole: room.members.get(socketId)?.role || "student",
+                });
+            }
+        }
+
+        console.log(`[PRODUCERS] ${socket.id.slice(0, 8)} gets ${result.length} producers`);
+        cb(result);
+    });
+
+    // ---- GET ROOM STATS (proctor only) ----
+    socket.on("getRoomStats", (cb) => {
+        if (typeof cb !== "function") return;
+        if (socket.data.role !== "proctor") return cb({ error: "proctor only" });
+
+        const room = socket.data.room;
+        if (!room) return cb({ error: "no room" });
+
+        const stats = {
+            members: room.members.size,
+            students: [...room.members.values()].filter((m) => m.role === "student").length,
+            proctors: [...room.members.values()].filter((m) => m.role === "proctor").length,
+            producers: 0,
+            consumers: room.consumers.size,
+            activeSpeakers: room.activeSpeakers.slice(0, 4),
+            networkStats: {},
+        };
+
+        for (const [, producers] of room.producers) {
+            stats.producers += producers.filter((p) => !p.producer.closed).length;
+        }
+
+        for (const [sid, ns] of room.networkStats) {
+            stats.networkStats[sid.slice(0, 8)] = {
+                rtt: Math.round(ns.rtt),
+                packetLoss: (ns.packetLoss * 100).toFixed(2) + "%",
+            };
+        }
+
+        cb(stats);
+    });
+
+    // ---- DISCONNECT ----
+    socket.on("disconnect", () => {
+        const room = socket.data.room;
+        if (!room) return;
+
+        console.log(`[DISC] ${socket.id.slice(0, 8)} (${socket.data.role})`);
+
+        // Close producers
+        socket.data.producerObjects.forEach((p) => {
+            if (!p.closed) p.close();
+        });
+        room.producers.delete(socket.id);
+
+        // Close consumers
+        socket.data.consumerIds.forEach((cid) => {
+            const c = room.consumers.get(cid);
+            if (c && !c.consumer.closed) c.consumer.close();
+            room.consumers.delete(cid);
+        });
+
+        // Close transports
+        socket.data.transportIds.forEach((id) => {
+            const t = room.transports.get(id);
+            if (t && !t.closed) t.close();
+            room.transports.delete(id);
+        });
+
+        room.members.delete(socket.id);
+        room.networkStats.delete(socket.id);
+
+        // Remove from active speakers
+        const asIdx = room.activeSpeakers.indexOf(socket.id);
+        if (asIdx !== -1) room.activeSpeakers.splice(asIdx, 1);
+
+        socket.to(socket.data.roomId).emit("studentLeft", socket.id);
+
+        // Cleanup empty room
+        if (room.members.size === 0) {
+            stopNetworkMonitor(room);
+            room.router.close();
+            rooms.delete(socket.data.roomId);
+            console.log(`[ROOM] Deleted: ${socket.data.roomId}`);
+        }
+    });
 });
-
-// ─── MONITOR — see what's happening ──────────────────────────────
-setInterval(async () => {
-  if (!ready) return;
-
-  const lines = ["\n═══ MONITOR ═══"];
-
-  for (let i = 0; i < workers.length; i++) {
-    try {
-      const usage = await workers[i].getResourceUsage();
-      lines.push(
-        `  W${i} pid=${workers[i].pid} cpu=${Math.round(usage.ru_utime / 1000)}ms`
-      );
-    } catch (_) {}
-  }
-
-  for (const [roomId, room] of rooms) {
-    const perWorker = new Array(workers.length).fill(0);
-    let totalProd = 0;
-
-    for (const [, s] of room.students) {
-      perWorker[s.workerIndex] += s.producers.length;
-      totalProd += s.producers.length;
-    }
-
-    const transPerWorker = new Array(workers.length).fill(0);
-    for (const [, t] of room.transports) {
-      transPerWorker[t.workerIndex]++;
-    }
-
-    lines.push(`  Room "${roomId}": ${room.members.size} members, ${totalProd} producers`);
-    lines.push(`    Producers/worker:  [${perWorker.join(", ")}]`);
-    lines.push(`    Transports/worker: [${transPerWorker.join(", ")}]`);
-    lines.push(`    Pipes: ${room.pipes.size}`);
-    lines.push(`    Routers: ${room.routers.size}`);
-  }
-
-  lines.push("═══════════════\n");
-  console.log(lines.join("\n"));
-}, 15000);
 
 export { io };

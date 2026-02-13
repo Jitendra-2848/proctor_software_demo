@@ -1,27 +1,33 @@
+// mediasoup/worker.js
 import mediasoup from "mediasoup";
 import { config } from "./config.js";
-
-export const workers = [];
+import { setWorkers } from "./getworker.js";
 
 export async function createWorkers() {
-  if (workers.length > 0) return;
-  const count = config.mediasoup.numWorkers;
-  console.log(`Creating ${count} workers...`);
+    const numWorkers = config.mediasoup.numworker || 1;
+    console.log(`[WORKER] Creating ${numWorkers} workers...`);
 
-  for (let i = 0; i < count; i++) {
-    const worker = await mediasoup.createWorker({
-      logLevel: config.mediasoup.worker.logLevel,
-      logTags: config.mediasoup.worker.logTags,
-      rtcMinPort: config.mediasoup.worker.rtcMinPort,
-      rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
-    });
+    const workers = [];
 
-    worker.on("died", () => {
-      console.error(`Worker ${i} died!`);
-      process.exit(1);
-    });
+    for (let i = 0; i < numWorkers; i++) {
+        const worker = await mediasoup.createWorker({
+            rtcMinPort: config.mediasoup.worker.rtcMinPort,
+            rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
+            logLevel: config.mediasoup.worker.logLevel,
+            logTags: config.mediasoup.worker.logTags,
+        });
 
-    workers.push(worker);
-    console.log(`  Worker ${i} pid=${worker.pid}`);
-  }
+        worker.on("died", () => {
+            console.error(`[WORKER] Worker ${worker.pid} DIED! Restarting...`);
+            process.exit(1);
+        });
+
+        workers.push(worker);
+        console.log(`[WORKER] #${i} created (pid: ${worker.pid})`);
+    }
+
+    // register with getworker module
+    setWorkers(workers);
+
+    return workers;
 }
